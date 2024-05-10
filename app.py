@@ -1,171 +1,272 @@
-import streamlit as st
+from uuid import uuid4
+import os
+import tempfile
+from io import BytesIO
+from typing import Dict
 
-from constants import (
-    STATUS_ENDPOINT,
-    LOCAL_FILE__TRANSCRIPTION_ENDPOINT,
-    YOUTUBE_TRANSCRIPTION_ENDPOINT,
-    LIVE_TRANSCRIPTION_WEBSOCKET_ENDPOINT,
-    WHISPER_SAMPLING_RATE,
-)
-from utils import (
-    handle_local_file_transcription,
-    handle_youtube_transcription,
-    handle_live_transcription,
-)
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, WebSocket
+from pydantic import BaseModel
+import numpy as np
+import whisper
+from pytube import YouTube
+from pydub import AudioSegment
 
-# Set page configuration
-st.set_page_config(
-    page_title="Transcription Tool",
-    page_icon=":microphone:",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# Initialize the app
+app = FastAPI(title="Data Science Capstone Assignment", version="0.1.0")
 
-# Sidebar styles
-st.markdown(
+
+# Schema for youtube transcription api
+class YoutubeUrl(BaseModel):
+    youtube_url: str
+
+
+# In-memory storage for task status
+tasks = {}
+
+# Load the Whisper model
+model = whisper.load_model("tiny.en")
+
+
+def create_task_id() -> str:
     """
-    <style>
-        .sidebar .sidebar-content {
-            background-color: #2e3f4f;
-            color: #ffffff;
-        }
-        .sidebar .sidebar-content .block-container a {
-            color: #ffffff;
-        }
-    </style>
-""",
-    unsafe_allow_html=True,
-)
+    Generates a unique task identifier using UUID4.
 
-# Main content styles
-st.markdown(
+    This function creates a universally unique identifier (UUID)
+    which can be used as a task ID for tracking individual transcription tasks.
+
+    Returns:
+        str: A unique task identifier as a string.
     """
-    <style>
-        .css-1v1pxco {
-            color: #ffffff;
-        }
-        .css-hi6a2p {
-            background-color: #465a6b;
-            border-radius: 10px;
-            padding: 20px;
-            box-shadow: 0px 0px 10px 0px rgba(0,0,0,0.1);
-        }
-        .stButton>button {
-            background-color: #007bff;
-            color: #ffffff;
-            border-radius: 5px;
-        }
-        .stButton>button:hover {
-            background-color: #0056b3;
-        }
-        .stTextInput>div>div>input {
-            background-color: #ffffff;
-            color: #333333;
-            border-radius: 5px;
-        }
-        .stTextInput>div>div>input:focus {
-            border-color: #007bff;
-        }
-    </style>
-""",
-    unsafe_allow_html=True,
-)
+    # Generate and return a new UUID4
+    return str(uuid4())
 
-if __name__ == "__main__":
-    # Title of the application
-    st.title("Advanced Transcription Tool")
 
-    st.markdown(
-        "Welcome to the Advanced Transcription Tool! This tool converts speech from audio files, YouTube videos, or live input into text. Select a mode and start transcribing!"
+async def process_local_audio_file(task_id: str, upload_file: UploadFile) -> None:
+    """
+    Processes an uploaded audio file for transcription using the Whisper model.
+
+    This function reads an audio file from an UploadFile object, processes it,
+    and transcribes it using the globally loaded Whisper model. The result of the
+    transcription is stored in the global 'tasks' dictionary.
+
+    Args:
+        task_id (str): A unique identifier for the transcription task.
+        upload_file (UploadFile): The audio file uploaded by the user.
+
+    Raises:
+        Exception: If an error occurs during file processing or transcription.
+    """
+    try:
+        # Extract the audio bytes from the uploaded file
+        audio_bytes = await upload_file.read()
+
+        # Use pydub to handle different audio formats and convert audio
+        audio = AudioSegment.from_file(BytesIO(audio_bytes))
+        audio = audio.set_channels(1).set_frame_rate(16000)
+
+        # Convert the audio to a raw data byte string
+        raw_data = audio.raw_data
+
+        # Convert the raw data into a NumPy array for processing
+        audio_np = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32)
+        audio_np /= np.iinfo(np.int16).max  # Normalize to range [-1.0, 1.0]
+
+        # Transcribe the audio using the Whisper model
+        result = model.transcribe(audio_np)
+        transcription = result.get("text")
+
+        # Update the task status with the transcription result
+        tasks[task_id] = {"status": "completed", "transcription": transcription}
+    except Exception as e:
+        # Handle any errors that occur during the processing
+        tasks[task_id] = {"status": "failed", "error": str(e)}
+        raise
+def download_youtube_audio(youtube_url: str) -> str:
+    """
+    Downloads the audio stream of a YouTube video to a temporary file.
+
+    Given a YouTube URL, this function downloads the audio stream with the highest bitrate
+    available and saves it to a temporary file. The path to the saved audio file is then returned.
+
+    Args:
+        youtube_url (str): The URL of the YouTube video from which to download the audio.
+
+    Returns:
+        str: The file path to the downloaded audio file.
+
+    Raises:
+        PytubeError: If an error occurs in downloading the audio from YouTube.
+    """
+    try:
+        # Initialize a YouTube object with the given URL
+        yt = YouTube(youtube_url)
+
+        # Select the highest bitrate audio stream available
+        audio_stream = (
+            yt.streams.filter(only_audio=True).order_by("bitrate").desc().first()
+        )
+
+        # Generate a temporary file path for storing the downloaded audio
+        temp_dir = tempfile.gettempdir()
+        temp_filename = audio_stream.default_filename
+        temp_filepath = os.path.join(temp_dir, temp_filename)
+
+        # Download the audio stream to the temporary file
+        audio_stream.download(output_path=temp_dir, filename=temp_filename)
+
+        return temp_filepath
+    except Exception as e:
+        # TODO Consider specific exception handling related to Pytube or network issues
+        raise Exception(f"Error downloading YouTube audio: {e}")
+
+
+def process_youtube_audio(task_id: str, file_path: str) -> None:
+    """
+    Processes and transcribes a YouTube audio file using the Whisper model.
+
+    This function reads an audio file from the given file path, transcribes it using
+    the globally loaded Whisper model, and updates the task status in the global
+    'tasks' dictionary. It handles any errors during transcription and ensures
+    that the temporary audio file is removed after processing.
+
+    Args:
+        task_id (str): The unique identifier of the transcription task.
+        file_path (str): The file path of the audio file to be transcribed.
+
+    Raises:
+        Exception: If an error occurs during transcription.
+    """
+    try:
+        # Transcribe the audio file using the Whisper model
+        result = model.transcribe(file_path)
+        transcription = result.get("text")
+
+        # Update the task status with the transcription result
+        tasks[task_id] = {"status": "completed", "transcription": transcription}
+    except Exception as e:
+        # Handle any errors that occur during transcription
+        tasks[task_id] = {"status": "failed", "error": str(e)}
+    finally:
+        # Ensure the temporary file is removed after processing
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+
+@app.get("/status/{task_id}")
+async def check_status(task_id: str) -> Dict[str, str]:
+    """
+    Endpoint to check the status of a transcription task.
+
+    Given a task ID, this endpoint returns the current status of the transcription task.
+    It could be 'processing', 'completed', or 'failed'. If the task ID is not found,
+    it returns a status indicating that the task is not found.
+
+    Args:
+        task_id (str): The unique identifier of the transcription task.
+
+    Returns:
+        Dict[str, str]: A dictionary containing the status of the task. If the task is
+        completed, it also includes the transcription text.
+    """
+    # Retrieve the task by its ID
+    task = tasks.get(task_id)
+
+    # Check if the task exists and return its status
+    if task:
+        return task
+
+    return {"status": "not found"}
+
+
+@app.post("/transcribe-local/")
+async def transcribe_local_file(
+    background_tasks: BackgroundTasks, file: UploadFile = File(...)
+) -> Dict[str, str]:
+    # Generate a unique task ID for this transcription request
+    task_id = create_task_id()
+
+    # Set the initial status of the task
+    tasks[task_id] = {"status": "processing"}
+
+    # Read the file into memory
+    file_contents = await file.read()
+
+    # Create a temporary file to store the file contents
+    temp_file_path = f"/tmp/{file.filename}"
+    with open(temp_file_path, "wb") as temp_file:
+        temp_file.write(file_contents)
+
+    # Enqueue the audio processing and transcription task
+    background_tasks.add_task(process_youtube_audio, task_id, temp_file_path)
+
+    # Return the task ID for status tracking
+    return {"task_id": task_id}
+
+
+@app.post("/transcribe-youtube/")
+async def transcribe_youtube(
+    background_tasks: BackgroundTasks, youtube_url: YoutubeUrl
+) -> Dict[str, str]:
+    """
+    Endpoint to handle the transcription of a YouTube video.
+
+    This endpoint receives a YouTube URL, creates a task ID for tracking,
+    and enqueues a background task to download the video's audio and
+    transcribe it. The task ID is returned for the client to track the
+    status of the transcription process.
+
+    Args:
+        background_tasks (BackgroundTasks): FastAPI utility for background task execution.
+        youtube_url (YoutubeUrl): Pydantic model that contains the YouTube video URL.
+
+    Returns:
+        Dict[str, str]: A dictionary containing the task ID for the transcription job.
+    """
+    # Generate a unique task ID for this transcription request
+    task_id = create_task_id()
+
+    # Set the initial status of the task
+    tasks[task_id] = {"status": "processing"}
+
+    # Enqueue the task for downloading and transcribing the YouTube audio
+    background_tasks.add_task(
+        process_youtube_audio, task_id, download_youtube_audio(youtube_url.youtube_url)
     )
 
-    st.sidebar.markdown(
-        """
-        ## How to Use this Tool:
-        Follow these steps to get your transcription:
+    # Return the task ID for status tracking
+    return {"task_id": task_id}
 
-        - **Select a mode of operation:** Choose whether to upload an audio file, enter a YouTube URL, or start live transcription.
-        - **Upload or Input:** Based on the selected mode, either upload an audio file, enter a YouTube URL, or simply start speaking when prompted.
-        - **Review:** Wait for the transcription to complete and then review your transcribed text.
-        """
-    )
 
-    # Sidebar for mode selection
-    transcription_mode = st.sidebar.radio(
-        "Choose a mode of operation:",
-        ("Transcribe Local File", "Transcribe from YouTube URL", "Transcribe Live"),
-    )
+@app.websocket("/ws")
+async def transcribe_websocket_stream(websocket: WebSocket) -> None:
+    """
+    WebSocket endpoint for real-time audio transcription.
 
-    # Make the transition based on transcription mode selected by the user
-    if transcription_mode == "Transcribe Local File":
-        # Load the audio file from the local file manager
-        uploaded_file = st.file_uploader("Choose a file", type=["wav"])
-        transcribed_file = None
+    This endpoint handles a WebSocket connection for real-time audio data streaming.
+    It receives audio data from the client, transcribes it using the Whisper model,
+    and sends the transcription text back to the client through the WebSocket.
 
-        # Define the endpoint of your FastAPI service
-        fastapi_endpoint = LOCAL_FILE__TRANSCRIPTION_ENDPOINT
-        status_endpoint = STATUS_ENDPOINT  # Endpoint to check the status
+    Args:
+        websocket (WebSocket): The WebSocket connection with the client.
 
-        # If the file is loaded and transcribe button is pressed, process the audio
-        if uploaded_file is not None:
-            if st.button("Transcribe Audio"):
-                handle_local_file_transcription(
-                    uploaded_file, fastapi_endpoint, status_endpoint
-                )
+    Raises:
+        Exception: If an error occurs during the WebSocket communication or transcription process.
+    """
+    await websocket.accept()
+    try:
+        while True:
+            # Receive audio data from the client
+            data = await websocket.receive_bytes()
 
-    if transcription_mode == "Transcribe from YouTube URL":
-        # Input for YouTube URL
-        youtube_url = st.text_input("Enter YouTube Video URL")
-        # Define the endpoint of your FastAPI service
-        fastapi_endpoint_youtube = YOUTUBE_TRANSCRIPTION_ENDPOINT
-        status_endpoint = STATUS_ENDPOINT
+            # Convert the received data to a NumPy array and process it
+            updated_data = np.frombuffer(data, dtype=np.float32).copy()
+            transcription = model.transcribe(updated_data)
 
-        # Handling the transcription request
-        if youtube_url:
-            if st.button("Transcribe Video"):
-                handle_youtube_transcription(
-                    youtube_url, fastapi_endpoint_youtube, status_endpoint
-                )
-
-    if transcription_mode == "Transcribe Live":
-        # Initialize the session state for recording status
-        st.session_state["stop_recording"] = False
-
-        # Define the websocket url
-        websocket_url = LIVE_TRANSCRIPTION_WEBSOCKET_ENDPOINT
-
-        # Define the microphone input sampling rate same as whisper model
-        sampling_rate = WHISPER_SAMPLING_RATE
-
-        if st.button("Transcribe Live"):
-            handle_live_transcription(sampling_rate, websocket_url)
-
-        else:
-            # If there is a transcription recorded display it
-            if "live_transcription" in st.session_state.keys():
-                # Create a container for text area
-                transcription_display = st.empty()
-
-                st.info(
-                    "You can edit the transcription before downloading by editing the textbox and pressing Ctrl+Enter"
-                )
-
-                st.session_state[
-                    "live_transcription"
-                ] = transcription_display.text_area(
-                    "Transcription",
-                    value=st.session_state["live_transcription"],
-                    height=300,
-                )
-
-                # Download button for the transcription
-                st.download_button(
-                    label="Download Transcription",
-                    data=st.session_state["live_transcription"],
-                    file_name="live_transcription.txt",
-                    mime="text/plain",
-                )
-
-                # Reset the session state
-                if st.button("Reset Transcription"):
-                    st.session_state["live_transcription"] = ""
+            # Send the transcription result back to the client
+            await websocket.send_text(transcription["text"])
+    except Exception as e:
+        # Log any exceptions that occur
+        print(f"Error in WebSocket communication: {e}")
+    finally:
+        # Close the WebSocket connection when done
+        await websocket.close()

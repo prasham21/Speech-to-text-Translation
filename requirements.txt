@@ -1,4 +1,7 @@
-streamlit
-websockets
-transformers
+uvicorn[standard]
+fastapi
+openai-whisper
+pydub
+pytube
+numpy
 python-multipart
